@@ -51,6 +51,9 @@ window.__ModuleLoader__.load({
       const [patrolError, setPatrolError] = React.useState('')
       const [realPost, setRealPost] = React.useState(false)
       const [replyText, setReplyText] = React.useState('提示：此账号只发主题、无任何回复记录')
+      const timer = React.useRef(null)
+
+      React.useEffect(() => () => { if (timer.current) clearTimeout(timer.current) }, [])
 
       React.useEffect(() => {
         let alive = true
@@ -109,10 +112,33 @@ window.__ModuleLoader__.load({
             dryRun: !realPost,
             text: replyText,
           })
-          if (v.ok === false) setPatrolError(v.error || '跑失败了')
-          else setPatrol(v)
-        } catch (err) { setPatrolError(String(err.message || err)) }
-        setPatrolBusy(false)
+          if (v.ok === false) { setPatrolError(v.error || '跑失败了'); setPatrolBusy(false); return }
+          pollPatrol()
+        } catch (err) { setPatrolError(String(err.message || err)); setPatrolBusy(false) }
+      }
+
+      const pollPatrol = () => {
+        const tick = async () => {
+          try {
+            const s = await api('patrolStatus')
+            if (s && !s.empty) setPatrol(s)
+            if (s && s.running) {
+              timer.current = setTimeout(tick, 1500)
+            } else {
+              timer.current = null
+              setPatrolBusy(false)
+            }
+          } catch (err) {
+            setPatrolError(String(err.message || err))
+            timer.current = null
+            setPatrolBusy(false)
+          }
+        }
+        tick()
+      }
+
+      const cancelPatrol = async () => {
+        try { await api('patrolCancel', {}) } catch (err) { setPatrolError(String(err.message || err)) }
       }
 
       const head = h('div', null,
@@ -199,18 +225,24 @@ window.__ModuleLoader__.load({
             h('div', { style: st.row },
               h('button', {
                 style: realPost ? st.btnPrimary : st.btn,
-                disabled: patrolBusy,
+                disabled: patrolBusy && !patrol,
                 onClick: runPatrol,
-              }, patrolBusy ? '跑着…（一轮大约一分钟）' : '跑一轮巡检'),
+              }, patrolBusy ? '跑着…' : '跑一轮巡检'),
+              patrolBusy
+                ? h('button', { style: st.btn, onClick: cancelPatrol }, '取消这轮')
+                : null,
             ),
             patrolError ? h('div', { style: st.error }, patrolError) : null,
             patrol
               ? h('div', null,
                   h('div', { style: st.caption },
-                    `查了 ${patrol.checked} / ${patrol.totalOperators} 个楼主，可疑 ${patrol.candidates} 个`
-                    + `${patrol.dryRun ? '（只报告，没发）' : `，已发 ${patrol.posted} 条`}`,
+                    `${patrol.running ? '正在跑' : '跑完了'}：查了 ${patrol.checked ?? 0} / ${patrol.totalOperators ?? '?'} 个楼主，`
+                    + `可疑 ${patrol.candidates ?? 0} 个`
+                    + `${patrol.dryRun ? '（只报告，没发）' : `，已发 ${patrol.posted ?? 0} 条`}`
+                    + `${patrol.stopped ? '，已取消' : ''}`
+                    + `${patrol.error ? `，出错：${patrol.error}` : ''}`,
                   ),
-                  ...patrol.results.map((r, i) => h('div', {
+                  ...(patrol.results || []).map((r, i) => h('div', {
                     key: String(r.uid) + i,
                     style: { fontSize: '12px', opacity: r.verdict && r.verdict.startsWith('★') ? 1 : 0.7, lineHeight: 1.7 },
                   },

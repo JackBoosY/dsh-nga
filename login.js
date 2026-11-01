@@ -514,22 +514,31 @@ export async function listUserActivity({ uid, page = 1, includeReplies = false }
   let res
   let buf
   let html = ''
-  for (let attempt = 0; attempt < 3; attempt++) {
-    res = await fetch(url, { method: 'GET', headers: browserHeaders(`${BASE}thread.php?fid=-7`), signal })
-    buf = Buffer.from(await res.arrayBuffer())
-    html = buf.toString('utf8')
-    if (html.includes('\uFFFD')) {
-      try { html = new TextDecoder('gb18030').decode(buf) } catch { /* 保留 utf8 */ }
+  let valid = false
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      res = await fetch(url, { method: 'GET', headers: browserHeaders(`${BASE}thread.php?fid=-7`), signal })
+      buf = Buffer.from(await res.arrayBuffer())
+      html = buf.toString('utf8')
+      if (html.includes('\uFFFD')) {
+        try { html = new TextDecoder('gb18030').decode(buf) } catch { /* 保留 utf8 */ }
+      }
+      valid = res.status === 200 && buf.length >= 8000 && /用户发布的(主题|帖子)/.test(html)
+      if (valid) break
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e
+      valid = false
     }
-    const looksReal = res.status === 200 && buf.length >= 8000 && /用户发布的(主题|帖子)/.test(html)
-    if (looksReal) break
-    await new Promise((r) => setTimeout(r, 1500))
+    await new Promise((r) => setTimeout(r, 600 + attempt * 900))
   }
   const items = parseUserTopics(html)
   const plain = htmlToText(html)
   return {
-    status: res.status,
-    bytes: buf.length,
+    status: res ? res.status : 0,
+    bytes: buf ? buf.length : 0,
+    // valid=false 表示这一页没真拿到（空壳页或连接失败）——
+    // 调用方千万不能把它当成「内容为空」（2026-11-01 因此误判过 Rotorywh）。
+    valid,
     url,
     uid: id,
     includeReplies: Boolean(includeReplies),
@@ -537,7 +546,7 @@ export async function listUserActivity({ uid, page = 1, includeReplies = false }
     items,
     // 只看 HTTP 状态。以前还判断正文里有没有「未登录」——结果有人发的帖子内容
     // 正好是「未登录」两个字，被误判成没登录（2026-11-01 踩到）。
-    needsLogin: res.status === 403,
+    needsLogin: Boolean(res) && res.status === 403,
   }
 }
 
@@ -611,6 +620,8 @@ async function fetchBoardOperators({ fid = '-7', page = 1 }, signal) {
 export async function patrolOnce({
   fid = '-7', page = 1, maxUsers = 12, dryRun = true,
   text = '提示：此账号只发主题、无任何回复记录',
+  shouldStop,      // () => boolean：每查完一个人问一次，true 就收工（给「取消」用）
+  onProgress,      // (snapshot) => void：每查完一个人报一次进度
 } = {}, auth, signal) {
   const board = await fetchBoardOperators({ fid, page }, signal)
   if (!board.ok) return { ok: false, error: board.error, results: [], checked: 0, posted: 0 }
@@ -622,35 +633,56 @@ export async function patrolOnce({
   const results = []
   let checked = 0
   let posted = 0
+  let stopped = false
   for (const o of byUid.values()) {
+    if (stopped) break
     if (checked >= maxUsers) break
+    if (shouldStop && shouldStop()) { stopped = true; break }
     await boardGap()
+
+    const push = (row) => {
+      results.push(row)
+      checked++
+      if (onProgress) {
+        onProgress({
+          checked,
+          totalOperators: byUid.size,
+          candidates: results.filter((r) => (r.verdict || '').startsWith('★')).length,
+          posted,
+          results: results.slice(),
+          stopped,
+        })
+      }
+    }
+
     let topics
     try {
       const a = await fetchTopicPage({ tid: o.tid }, auth, signal) // 顺带确认这帖还活着
-      if (!a || a.status !== 200) { results.push({ ...o, verdict: `帖子打不开(${a && a.status})` }); continue }
+      if (!a || a.status !== 200) { push({ ...o, verdict: `帖子打不开(${a && a.status})` }); continue }
       const t = await listUserActivity({ uid: o.uid }, auth, signal)
-      if (t.status !== 200) { results.push({ ...o, verdict: `主题页(${t.status})` }); continue }
+      // valid=false 是「没拿到」，不是「一个主题都没有」——不能据此判空
+      if (!t.valid) { push({ ...o, verdict: '主题页没拿到（空壳/连接失败），判不了' }); continue }
       topics = t.items.length
     } catch (e) {
-      results.push({ ...o, verdict: '查主题出错: ' + e.message })
+      if (e && e.name === 'AbortError') throw e
+      push({ ...o, verdict: '查主题出错: ' + e.message })
       continue
     }
-    checked++
-    if (topics < 3) { results.push({ ...o, topics, verdict: `主题只有 ${topics} 个` }); continue }
+    if (topics < 3) { push({ ...o, topics, verdict: `主题只有 ${topics} 个` }); continue }
 
     await boardGap()
     let posts
     try {
       const b = await listUserActivity({ uid: o.uid, includeReplies: true }, auth, signal)
-      if (b.status !== 200) { results.push({ ...o, topics, verdict: `回复页(${b.status})` }); continue }
+      if (!b.valid) { push({ ...o, topics, verdict: '回复页没拿到（空壳/连接失败），判不了' }); continue }
       posts = b.items.length
     } catch (e) {
-      results.push({ ...o, topics, verdict: '查回复出错: ' + e.message })
+      if (e && e.name === 'AbortError') throw e
+      push({ ...o, topics, verdict: '查回复出错: ' + e.message })
       continue
     }
 
-    if (posts > 0) { results.push({ ...o, topics, posts, verdict: `回过 ${posts} 条` }); continue }
+    if (posts > 0) { push({ ...o, topics, posts, verdict: `回过 ${posts} 条` }); continue }
 
     // 到这里就是「只发主题、从不回帖」
     const row = { ...o, topics, posts: 0, verdict: '★只发主题、从不回帖' }
@@ -665,7 +697,7 @@ export async function patrolOnce({
         row.replyMessage = e.message
       }
     }
-    results.push(row)
+    push(row)
   }
 
   return {
@@ -677,6 +709,7 @@ export async function patrolOnce({
     totalOperators: byUid.size,
     candidates: results.filter((r) => (r.verdict || '').startsWith('★')).length,
     posted,
+    stopped,
     results,
   }
 }

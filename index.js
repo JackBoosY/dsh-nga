@@ -71,6 +71,9 @@ async function readBody(req) {
 export function apply(ctx) {
   const store = ctx.credentials
 
+  // 巡检只允许同时跑一轮；状态挂在内存里，前端轮询它
+  let patrolJob = null
+
   // ---------- 本地路由（给设置界面用） ----------
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
@@ -118,22 +121,53 @@ export function apply(ctx) {
         }
 
         // 一轮巡检：第一页帖子 → 查楼主发帖记录 → 判定 → （可选）回复
-        // dryRun 默认 true：只报告，不发。真发要前端显式勾选。
+        // 跑在后台：立刻回 jobId，前端轮询 patrolStatus 看进度，patrolCancel 能叫停。
         if (action === 'patrol') {
           const creds = await readCreds(store)
           if (!creds) return sendJson(res, 200, { ok: false, error: '还没登录' })
-          const out = await patrolOnce(
-            {
-              fid: body.fid || '-7',
-              page: Number(body.page) > 0 ? Number(body.page) : 1,
-              maxUsers: Number(body.maxUsers) > 0 ? Number(body.maxUsers) : 12,
-              dryRun: body.dryRun !== false,
-              text: typeof body.text === 'string' && body.text.trim() ? body.text.trim() : undefined,
+          if (patrolJob && patrolJob.state.running) {
+            return sendJson(res, 200, { ok: false, error: '上一轮还在跑，先等它结束或者取消' })
+          }
+          const q = (k, d) => {
+            const v = url.searchParams.get(k)
+            if (v != null && v !== '') return v
+            const b = body[k]
+            return b != null && b !== '' ? b : d
+          }
+          const job = {
+            aborted: false,
+            state: {
+              running: true, fid: '-7', page: 1, dryRun: true,
+              checked: 0, totalOperators: 0, candidates: 0, posted: 0,
+              results: [], startedAt: Date.now(), error: '',
             },
-            creds,
-            AbortSignal.timeout(240000),
-          )
-          return sendJson(res, 200, out)
+          }
+          patrolJob = job
+          const opts = {
+            fid: String(q('fid', '-7')),
+            page: Number(q('page', 1)) > 0 ? Number(q('page', 1)) : 1,
+            maxUsers: Number(q('maxUsers', 12)) > 0 ? Number(q('maxUsers', 12)) : 12,
+            dryRun: String(q('dryRun', 'true')) !== 'false',
+            text: String(q('text', '') || '').trim() || undefined,
+            shouldStop: () => job.aborted,
+            onProgress: (snap) => { job.state = { ...job.state, ...snap, running: true } },
+          }
+          job.state.dryRun = opts.dryRun
+          patrolOnce(opts, creds, AbortSignal.timeout(600000))
+            .then((out) => { job.state = { ...job.state, ...out, running: false } })
+            .catch((e) => { job.state = { ...job.state, running: false, error: e && e.message ? e.message : String(e) } })
+          return sendJson(res, 200, { ok: true, jobId: 'current', dryRun: opts.dryRun, maxUsers: opts.maxUsers })
+        }
+
+        if (action === 'patrolStatus') {
+          if (!patrolJob) return sendJson(res, 200, { ok: true, running: false, empty: true })
+          return sendJson(res, 200, { ok: true, ...patrolJob.state })
+        }
+
+        if (action === 'patrolCancel') {
+          if (!patrolJob || !patrolJob.state.running) return sendJson(res, 200, { ok: true, cancelled: false, message: '没有在跑的' })
+          patrolJob.aborted = true
+          return sendJson(res, 200, { ok: true, cancelled: true })
         }
 
         return sendJson(res, 404, { error: '不认识的 action: ' + action })
