@@ -135,7 +135,7 @@ window.__ModuleLoader__.load({
       const pollPatrol = () => {
         const tick = async () => {
           try {
-            const s = await api('patrolStatus')
+            const s = await api('patrolStatus', {})
             if (s && !s.empty) setPatrol(s)
             if (s && s.running) {
               timer.current = setTimeout(tick, 1500)

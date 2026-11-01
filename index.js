@@ -86,7 +86,9 @@ export function apply(ctx) {
           const creds = await readCreds(store)
           return sendJson(res, 200, { configured: Boolean(creds), uid: creds ? creds.uid : '' })
         }
-        if (req.method !== 'POST') return sendJson(res, 405, { error: '要用 POST' })
+        // 查进度允许 GET：前端轮询时没带 body，会被当成 GET（2026-11-01 报过「要用 POST」）
+        const isPoll = action === 'patrolStatus'
+        if (req.method !== 'POST' && !isPoll) return sendJson(res, 405, { error: '要用 POST' })
         const body = await readBody(req)
 
         if (action === 'captcha') {

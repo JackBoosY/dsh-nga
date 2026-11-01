@@ -1,6 +1,6 @@
 {
   "name": "dsh-nga",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Read NGA (艾泽拉斯国家地理) topics from DeepSeek Harness: sign in with account + captcha, read threads floor by floor, browse a user's posts, and reply",
   "type": "module",
   "main": "index.js",
