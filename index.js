@@ -13,7 +13,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fetchCaptcha, listUserActivity, newRid, passwordLogin, readTopic, replyTopic, userActivityToText } from './login.js'
+import { fetchCaptcha, listUserActivity, newRid, passwordLogin, patrolOnce, readTopic, replyTopic, userActivityToText } from './login.js'
 
 export const name = 'dsh-nga'
 export const inject = ['tools', 'credentials', 'webServer']
@@ -115,6 +115,25 @@ export function apply(ctx) {
             AbortSignal.timeout(45000),
           )
           return sendJson(res, 200, { ok: true, ...out })
+        }
+
+        // 一轮巡检：第一页帖子 → 查楼主发帖记录 → 判定 → （可选）回复
+        // dryRun 默认 true：只报告，不发。真发要前端显式勾选。
+        if (action === 'patrol') {
+          const creds = await readCreds(store)
+          if (!creds) return sendJson(res, 200, { ok: false, error: '还没登录' })
+          const out = await patrolOnce(
+            {
+              fid: body.fid || '-7',
+              page: Number(body.page) > 0 ? Number(body.page) : 1,
+              maxUsers: Number(body.maxUsers) > 0 ? Number(body.maxUsers) : 12,
+              dryRun: body.dryRun !== false,
+              text: typeof body.text === 'string' && body.text.trim() ? body.text.trim() : undefined,
+            },
+            creds,
+            AbortSignal.timeout(240000),
+          )
+          return sendJson(res, 200, out)
         }
 
         return sendJson(res, 404, { error: '不认识的 action: ' + action })

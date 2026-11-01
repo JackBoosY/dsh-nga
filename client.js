@@ -46,6 +46,11 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState('')
       const [error, setError] = React.useState('')
       const [notice, setNotice] = React.useState('')
+      const [patrol, setPatrol] = React.useState(null)
+      const [patrolBusy, setPatrolBusy] = React.useState(false)
+      const [patrolError, setPatrolError] = React.useState('')
+      const [realPost, setRealPost] = React.useState(false)
+      const [replyText, setReplyText] = React.useState('提示：此账号只发主题、无任何回复记录')
 
       React.useEffect(() => {
         let alive = true
@@ -92,6 +97,22 @@ window.__ModuleLoader__.load({
           setNotice('已退出')
         } catch (err) { setError(String(err.message || err)) }
         setBusy('')
+      }
+
+      const runPatrol = async () => {
+        setPatrolBusy(true); setPatrolError(''); setPatrol(null)
+        try {
+          const v = await api('patrol', {
+            fid: '-7',
+            page: 1,
+            maxUsers: 12,
+            dryRun: !realPost,
+            text: replyText,
+          })
+          if (v.ok === false) setPatrolError(v.error || '跑失败了')
+          else setPatrol(v)
+        } catch (err) { setPatrolError(String(err.message || err)) }
+        setPatrolBusy(false)
       }
 
       const head = h('div', null,
@@ -151,12 +172,63 @@ window.__ModuleLoader__.load({
             h('div', { style: st.caption }, '验证码要你自己看、自己填——我不会去认那串字。'),
           )
 
+      const patrolBlock = loggedIn
+        ? h('div', { style: { ...st.wrap, borderTop: '1px solid rgba(128,128,128,.25)', paddingTop: '12px' } },
+            h('div', { style: { fontSize: '13px', fontWeight: 600 } }, '巡检机器人'),
+            h('div', { style: st.caption },
+              '拉版面第一页 → 挨个查楼主的发帖记录 → 主题 ≥3 个且从没回过帖的，记为可疑。',
+              h('br'),
+              '实测这个版块里基本没有这种号，跑一轮多半是空转。',
+            ),
+            h('div', { style: st.row },
+              h('span', { style: st.label }, '要发的'),
+              h('input', {
+                style: st.input, value: replyText,
+                onChange: ev => setReplyText(ev.target.value),
+              }),
+            ),
+            h('div', { style: st.row },
+              h('label', { style: { ...st.caption, display: 'flex', alignItems: 'center', gap: '6px' } },
+                h('input', {
+                  type: 'checkbox', checked: realPost,
+                  onChange: ev => setRealPost(ev.target.checked),
+                }),
+                '真的发出去（不勾只报告，不碰账号）',
+              ),
+            ),
+            h('div', { style: st.row },
+              h('button', {
+                style: realPost ? st.btnPrimary : st.btn,
+                disabled: patrolBusy,
+                onClick: runPatrol,
+              }, patrolBusy ? '跑着…（一轮大约一分钟）' : '跑一轮巡检'),
+            ),
+            patrolError ? h('div', { style: st.error }, patrolError) : null,
+            patrol
+              ? h('div', null,
+                  h('div', { style: st.caption },
+                    `查了 ${patrol.checked} / ${patrol.totalOperators} 个楼主，可疑 ${patrol.candidates} 个`
+                    + `${patrol.dryRun ? '（只报告，没发）' : `，已发 ${patrol.posted} 条`}`,
+                  ),
+                  ...patrol.results.map((r, i) => h('div', {
+                    key: String(r.uid) + i,
+                    style: { fontSize: '12px', opacity: r.verdict && r.verdict.startsWith('★') ? 1 : 0.7, lineHeight: 1.7 },
+                  },
+                    `${r.author || r.uid}　主题 ${r.topics ?? '?'}　回复 ${r.posts ?? '?'}　${r.verdict || ''}`
+                    + `${r.replied === true ? '　已回' : r.replied === false ? `　发失败：${r.replyMessage || ''}` : ''}`,
+                  )),
+                )
+              : null,
+          )
+        : null
+
       return h('div', { style: st.wrap },
         head,
         statusLine,
         form,
         error ? h('div', { style: st.error }, error) : null,
         notice ? h('div', { style: st.ok }, notice) : null,
+        patrolBlock,
       )
     }
 

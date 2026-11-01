@@ -510,15 +510,20 @@ export async function listUserActivity({ uid, page = 1, includeReplies = false }
   const url = `${BASE}thread.php?${qs.toString()}`
   // 用 GET：POST 过去会被 NGA 挡成一个 ~3KB 的空壳页（状态 200 但没数据，2026-11-01 踩到）。
   // 身份靠浏览器 cookie，token 在这个页面上没用。
-  const res = await fetch(url, {
-    method: 'GET',
-    headers: browserHeaders(`${BASE}thread.php?fid=-7`),
-    signal,
-  })
-  const buf = Buffer.from(await res.arrayBuffer())
-  let html = buf.toString('utf8')
-  if (html.includes('\uFFFD')) {
-    try { html = new TextDecoder('gb18030').decode(buf) } catch { /* 保留 utf8 */ }
+  // 空壳页会骗人（曾把 33 个主题读成 0 个），所以按「大小 + 页面标题」验一遍，不对就重试。
+  let res
+  let buf
+  let html = ''
+  for (let attempt = 0; attempt < 3; attempt++) {
+    res = await fetch(url, { method: 'GET', headers: browserHeaders(`${BASE}thread.php?fid=-7`), signal })
+    buf = Buffer.from(await res.arrayBuffer())
+    html = buf.toString('utf8')
+    if (html.includes('\uFFFD')) {
+      try { html = new TextDecoder('gb18030').decode(buf) } catch { /* 保留 utf8 */ }
+    }
+    const looksReal = res.status === 200 && buf.length >= 8000 && /用户发布的(主题|帖子)/.test(html)
+    if (looksReal) break
+    await new Promise((r) => setTimeout(r, 1500))
   }
   const items = parseUserTopics(html)
   const plain = htmlToText(html)
@@ -552,4 +557,126 @@ export function userActivityToText(res, { page = 1, maxItems = 30 } = {}) {
     return bits.join('  ') + snip
   })
   return [head, ...lines].join('\n')
+}
+
+// ---------- 一轮巡检：第一页帖子 → 查楼主发帖记录 → 判定 → （可选）回复 ----------
+// 判定：这个楼主发过 ≥3 个主题，且「回复」那一列为空。
+// 说明：2026-11-01 实测网事杂谈前 6 页 120+ 个楼主里一个都没有，所以这一步多数时候是空转。
+//       真发要显式 dryRun=false；默认只报告，不发。
+
+const BOARD_MIN_BYTES = 8000
+const BOARD_SLEEP = (ms) => new Promise((r) => setTimeout(r, ms))
+const boardGap = () => BOARD_SLEEP(1000 + Math.floor(Math.random() * 800))
+
+/** 取一页版面列表的楼主。响应太小/没标题就当空壳，重试一次。 */
+async function fetchBoardOperators({ fid = '-7', page = 1 }, signal) {
+  const url = page > 1 ? `${BASE}thread.php?fid=${fid}&page=${page}` : `${BASE}thread.php?fid=${fid}`
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers: browserHeaders(`${BASE}thread.php?fid=-7`), signal })
+      const buf = Buffer.from(await res.arrayBuffer())
+      let html = buf.toString('utf8')
+      if (html.includes('\uFFFD')) { try { html = new TextDecoder('gb18030').decode(buf) } catch {} }
+      if (res.status === 200 && buf.length >= BOARD_MIN_BYTES && html.includes('topicrow')) {
+        const ops = []
+        const seen = new Set()
+        for (const [, seg] of html.matchAll(/<tr[^>]*class=['"][^"']*topicrow[^"']*['"][^>]*>([\s\S]*?)<\/tr>/gi)) {
+          const tid = (seg.match(/read\.php\?tid=(\d+)/) || [])[1] || ''
+          const uid = (seg.match(/func=ucp&uid=(\d+)/) || [])[1] || ''
+          const author = ((seg.match(/class=['"]author['"][^>]*>([\s\S]*?)<\/a>/) || [])[1] || '').replace(/<[^>]+>/g, '').trim()
+          const title = ((seg.match(/class=['"]topic['"][^>]*>([\s\S]*?)<\/a>/) || [])[1] || '').replace(/<[^>]+>/g, '').trim()
+          const replies = Number((seg.match(/class=['"]replies['"][^>]*>(\d+)</) || [])[1] || 0)
+          if (!tid || !uid || Number(tid) < 100) continue
+          if (/帖子发布或回复时间超过限制/.test(title) && Number(tid) < 100) continue
+          const key = uid + '#' + tid
+          if (seen.has(key)) continue
+          seen.add(key)
+          ops.push({ tid, uid, author, title, replies })
+        }
+        return { ok: true, ops, url, bytes: buf.length }
+      }
+    } catch (e) {
+      if (attempt === 2) return { ok: false, error: e.message, url }
+    }
+    await BOARD_SLEEP(1500)
+  }
+  return { ok: false, error: '版面页反复拿不到（空壳/失败）', url }
+}
+
+/**
+ * 跑一轮巡检。
+ *   dryRun=true（默认）只报告，不发任何东西。
+ *   dryRun=false 时，对判定为「只发主题、从不回帖」的楼主，在他那条帖子里回 text。
+ */
+export async function patrolOnce({
+  fid = '-7', page = 1, maxUsers = 12, dryRun = true,
+  text = '提示：此账号只发主题、无任何回复记录',
+} = {}, auth, signal) {
+  const board = await fetchBoardOperators({ fid, page }, signal)
+  if (!board.ok) return { ok: false, error: board.error, results: [], checked: 0, posted: 0 }
+
+  // 同一个楼主只留第一帖
+  const byUid = new Map()
+  for (const o of board.ops) if (!byUid.has(o.uid)) byUid.set(o.uid, o)
+
+  const results = []
+  let checked = 0
+  let posted = 0
+  for (const o of byUid.values()) {
+    if (checked >= maxUsers) break
+    await boardGap()
+    let topics
+    try {
+      const a = await fetchTopicPage({ tid: o.tid }, auth, signal) // 顺带确认这帖还活着
+      if (!a || a.status !== 200) { results.push({ ...o, verdict: `帖子打不开(${a && a.status})` }); continue }
+      const t = await listUserActivity({ uid: o.uid }, auth, signal)
+      if (t.status !== 200) { results.push({ ...o, verdict: `主题页(${t.status})` }); continue }
+      topics = t.items.length
+    } catch (e) {
+      results.push({ ...o, verdict: '查主题出错: ' + e.message })
+      continue
+    }
+    checked++
+    if (topics < 3) { results.push({ ...o, topics, verdict: `主题只有 ${topics} 个` }); continue }
+
+    await boardGap()
+    let posts
+    try {
+      const b = await listUserActivity({ uid: o.uid, includeReplies: true }, auth, signal)
+      if (b.status !== 200) { results.push({ ...o, topics, verdict: `回复页(${b.status})` }); continue }
+      posts = b.items.length
+    } catch (e) {
+      results.push({ ...o, topics, verdict: '查回复出错: ' + e.message })
+      continue
+    }
+
+    if (posts > 0) { results.push({ ...o, topics, posts, verdict: `回过 ${posts} 条` }); continue }
+
+    // 到这里就是「只发主题、从不回帖」
+    const row = { ...o, topics, posts: 0, verdict: '★只发主题、从不回帖' }
+    if (!dryRun) {
+      try {
+        const r = await replyTopic({ tid: o.tid, fid, content: text }, auth, signal)
+        row.replied = r.ok
+        row.replyMessage = r.message
+        if (r.ok) posted++
+      } catch (e) {
+        row.replied = false
+        row.replyMessage = e.message
+      }
+    }
+    results.push(row)
+  }
+
+  return {
+    ok: true,
+    fid,
+    page,
+    dryRun,
+    checked,
+    totalOperators: byUid.size,
+    candidates: results.filter((r) => (r.verdict || '').startsWith('★')).length,
+    posted,
+    results,
+  }
 }
