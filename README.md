@@ -83,6 +83,14 @@ dsh plugin --profile web add github:JackBoosY/dsh-nga
 | `page` | integer | 页码，默认 1 |
 | `maxItems` | integer | 最多显示多少条，默认 30 |
 
+**这个功能需要浏览器的登录 cookie**，光有 `access_uid` / `access_token` 不行：
+
+- NGA 对 `thread.php?authorid=…` 会检查请求"像不像浏览器"。只带 token 的话，连发两三个就整片 503（跟间隔快慢无关）；
+- 补上浏览器的 UA、`Accept-Language`、`sec-fetch-*`、`sec-ch-ua` 之后，还要带上 `ngaPassportUid` / `ngaPassportCid` 两个 cookie；
+- 放法：写进 `~/.dsh/nga-creds.json` 的 `cookie_uid` / `cookie_cid`（或环境变量 `NGA_COOKIE_UID` / `NGA_COOKIE_CID`）；
+- 这两个值在浏览器 F12 → Application → Cookies → `https://bbs.nga.cn` 里能取到。它们等同于登录凭证，别外传；
+- 这个页面要用 **GET**：POST 会拿到一个约 3KB 的空壳页（状态码还是 200，但没有数据）。
+
 数据来自 `thread.php?authorid=<uid>`（主题）和 `thread.php?authorid=<uid>&searchpost=1`（帖子）。
 
 ## 功能范围

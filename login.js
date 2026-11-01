@@ -8,10 +8,64 @@
 //          trackid= __ngaClientChecksum= name=<账号> type= password=<RSA> rid=<rid> captcha=<人填>
 //   读帖 = POST /read.php?tid=..&page=..  表单带 access_uid/access_token；UA 用 NGA_WP_JW/(;WINDOWS)
 import { constants, createPublicKey, publicEncrypt, randomBytes } from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 
 const BASE = 'https://bbs.nga.cn/'
 const NUKE = BASE + 'nuke.php'
 const READ_UA = 'NGA_WP_JW/(;WINDOWS)'
+
+// 2026-11-01：光带 access_uid/token 会被 NGA 判成「不像浏览器」，用户页直接 503
+// （连发几个就封，跟频率无关）。补齐浏览器的 UA / Accept / sec-fetch-* 之后 6/6、11/11 全过。
+// 另外浏览器还带登录 cookie ngaPassportUid / ngaPassportCid，从 ~/.dsh/nga-creds.json 里取。
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+let cookieCache
+/** 登录 cookie（浏览器里那套）。没有就返回空串，请求退回 token。 */
+export function loadCookies() {
+  if (cookieCache !== undefined) return cookieCache
+  const parts = []
+  const uid = process.env.NGA_COOKIE_UID
+  const cid = process.env.NGA_COOKIE_CID
+  if (uid) parts.push(`ngaPassportUid=${uid}`)
+  if (cid) parts.push(`ngaPassportCid=${cid}`)
+  if (!parts.length) {
+    try {
+      const file = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'nga-creds.json')
+      const j = JSON.parse(fs.readFileSync(file, 'utf8'))
+      const u = j.cookie_uid || j.ngaPassportUid
+      const k = j.cookie_cid || j.ngaPassportCid
+      if (u) parts.push(`ngaPassportUid=${u}`)
+      if (k) parts.push(`ngaPassportCid=${k}`)
+    } catch { /* 没文件就算了 */ }
+  }
+  cookieCache = parts.join('; ')
+  return cookieCache
+}
+
+/** 一套「像浏览器」的请求头。cookie 有就带上。 */
+export function browserHeaders(referer) {
+  const h = {
+    'User-Agent': BROWSER_UA,
+    'X-User-Agent': BROWSER_UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Referer': referer || `${BASE}thread.php?fid=-7`,
+    'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+  }
+  const cookie = loadCookies()
+  if (cookie) h['Cookie'] = cookie
+  return h
+}
+
 const PASSPORT_PUBLIC_KEY = (
   'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyKzZWDimCN1OCprqWUhFUPhcwxDE62/BFVP6LtQHJu+65dm4YNmD'
   + 'vzitmcfaXW9YbhXnd4oP7j+6vpcgJQ+p3ucySo1ZnqO0Bb2JKEtxpCmxe7IYXhFEkJqHpFYBTiAxQz2n2mX4JZy/ehBUSMjzg'
@@ -196,6 +250,7 @@ async function fetchTopicPage({ tid, page = 1, authorId }, auth, signal) {
   const form = new URLSearchParams()
   if (auth && auth.uid) form.set('access_uid', auth.uid)
   if (auth && auth.token) form.set('access_token', auth.token)
+  // read.php 用 NGA_WP_JW + token 那条路是通的（2026-11-01 实测），别换成浏览器头，会 403。
   const headers = { 'User-Agent': READ_UA, 'X-User-Agent': READ_UA, Referer: `${BASE}/`, 'Content-Type': 'application/x-www-form-urlencoded' }
   const res = await fetch(url, { method: 'POST', headers, body: form.toString(), signal })
   const buf = Buffer.from(await res.arrayBuffer())
@@ -453,13 +508,11 @@ export async function listUserActivity({ uid, page = 1, includeReplies = false }
   if (includeReplies) qs.set('searchpost', '1')
   if (Number(page) > 1) qs.set('page', String(page))
   const url = `${BASE}thread.php?${qs.toString()}`
-  const form = new URLSearchParams()
-  if (auth && auth.uid) form.set('access_uid', auth.uid)
-  if (auth && auth.token) form.set('access_token', auth.token)
+  // 用 GET：POST 过去会被 NGA 挡成一个 ~3KB 的空壳页（状态 200 但没数据，2026-11-01 踩到）。
+  // 身份靠浏览器 cookie，token 在这个页面上没用。
   const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'User-Agent': READ_UA, 'X-User-Agent': READ_UA, Referer: `${BASE}/`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: form.toString(),
+    method: 'GET',
+    headers: browserHeaders(`${BASE}thread.php?fid=-7`),
     signal,
   })
   const buf = Buffer.from(await res.arrayBuffer())
