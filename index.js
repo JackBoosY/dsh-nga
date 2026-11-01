@@ -13,7 +13,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fetchCaptcha, newRid, passwordLogin, readTopic } from './login.js'
+import { fetchCaptcha, newRid, passwordLogin, readTopic, replyTopic } from './login.js'
 
 export const name = 'dsh-nga'
 export const inject = ['tools', 'credentials', 'webServer']
@@ -189,6 +189,48 @@ export function apply(ctx) {
       const body = head ? `${head}\n\n${out.text}` : out.text
       const limit = Number(args.maxChars) > 0 ? Number(args.maxChars) : 8000
       return body.length > limit ? body.slice(0, limit) + '\n…（后面截掉了）' : body
+    },
+  })
+
+  // ---------- 工具：回帖 ----------
+  // 这是往主人的 NGA 账号上发公开内容，所以有硬闸：必须显式传 confirm: true。
+  ctx.tools.register({
+    name: 'nga_reply',
+    description:
+      'Post a reply to an NGA (bbs.nga.cn) topic using the signed-in account. THE REPLY IS PUBLIC AND PERMANENT — '
+      + 'it appears under the user\'s name for everyone. Never call this without the user explicitly asking for that '
+      + 'exact reply. The call must carry confirm: true; without it the tool refuses. Keep the text short and human.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        tid: { type: 'string', description: 'Topic id (the number in read.php?tid=...)' },
+        content: { type: 'string', description: 'Reply body. NGA wants 6–65530 bytes; keep it short.' },
+        fid: { type: 'string', description: 'Board id. Omit to look it up from the topic page.' },
+        pid: { type: 'string', description: 'Reply to that floor instead of the whole thread (楼中楼)' },
+        confirm: { type: 'boolean', description: 'Must be true. Confirms the user asked for this exact public reply.' },
+      },
+      required: ['tid', 'content'],
+    },
+    output: {
+      schema: { type: 'string' },
+      render(_args, value) { return [{ type: 'text', text: value }] },
+    },
+    async execute(args) {
+      if (args.confirm !== true) {
+        return '没发。这个工具会往主人的账号上发公开内容，必须显式传 confirm: true；'
+          + '而且要先确认主人真的要发这一条。'
+      }
+      const creds = await readCreds(store)
+      if (!creds) return '没登录，发不了。请在「设置 → NGA」里登录一次。'
+      const out = await replyTopic(
+        { tid: args.tid, fid: args.fid, content: args.content, pid: args.pid },
+        creds,
+        AbortSignal.timeout(45000),
+      )
+      return out.ok
+        ? `发出去了（HTTP ${out.status}${out.fid ? `，fid ${out.fid}` : ''}）。`
+        : `没发成：${out.message}`
     },
   })
 }

@@ -165,14 +165,15 @@ export function parseFloors(html) {
   return floors
 }
 
-/** 帖子标题 / 版面 / 最大页码。 */
+/** 帖子标题 / 版面 / 最大页码 / fid。 */
 export function parseTopicMeta(html) {
   const src = String(html)
   const title = htmlToText((src.match(/id='currentTopicName'[^>]*>([\s\S]*?)<\/h1>/) || [])[1] || '')
   const forum = htmlToText((src.match(/id='currentForumName'[^>]*>([\s\S]*?)<\/h2>/) || [])[1] || '')
+  const fid = (src.match(/__CURRENT_FID=parseInt\('(-?\d+)'\)/) || [])[1] || ''
   let pages = 1
   for (const m of src.matchAll(/read\.php\?tid=\d+&(?:amp;)?page=(\d+)/g)) pages = Math.max(pages, Number(m[1]))
-  return { title, forum, pages }
+  return { title, forum, fid, pages }
 }
 
 /** 把一页楼层拼成给人/模型看的文本。 */
@@ -248,6 +249,7 @@ export async function readTopic({ tid, page = 1, pages, authorId, authorOnly, ma
     url: first.url,
     title: first.title,
     forum: first.forum,
+    fid: first.fid || '',
     pages: Math.max(first.pages || 1, ...results.map((r) => r.pages || 1)),
     authorId: effectiveAuthor || '',
     floors: results.flatMap((r) => r.floors),
@@ -272,4 +274,101 @@ export function normalizePages(pages, page = 1, maxPages = 5) {
   }
   const one = Number(s)
   return [Number.isFinite(one) && one >= 1 ? one : Math.max(1, Number(page) || 1)]
+}
+
+// ---------- 回复 ----------
+// 协议（2026-11-01 用真请求试出来的）：
+//   1) POST /post.php?action=reply&fid=<fid>&tid=<tid>（带 access_uid/token）
+//      → 页面里有 var __U={…"auth":"<一次性口令>"…}；没有表单，是 JS 现拼的
+//   2) POST 同一个 URL，表单：
+//        step=2  auth=<上面那个>  post_content=<正文>  pid=<回复某楼时带>  post_subject=
+//        __inchst=UTF-8  access_uid  access_token
+//      空正文会被拒：「内容过短或过长(6~65530 byte) (ERROR: 2048 )」——证明形状是对的。
+
+const REPLY_UA = 'NGA_WP_JW/(;WINDOWS)'
+
+async function postReplyPage({ tid, fid }, auth, body, signal) {
+  const form = new URLSearchParams(body || '')
+  if (auth && auth.uid) form.set('access_uid', auth.uid)
+  if (auth && auth.token) form.set('access_token', auth.token)
+  const url = `${BASE}post.php?action=reply&fid=${encodeURIComponent(fid)}&tid=${encodeURIComponent(tid)}`
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'User-Agent': REPLY_UA,
+      'X-User-Agent': REPLY_UA,
+      Referer: `${BASE}read.php?tid=${tid}`,
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    },
+    body: form.toString(),
+    signal,
+  })
+  const buf = Buffer.from(await res.arrayBuffer())
+  let text = buf.toString('utf8')
+  if (text.includes('\uFFFD')) {
+    try { text = new TextDecoder('gb18030').decode(buf) } catch { /* 保留 utf8 */ }
+  }
+  return { status: res.status, text, url }
+}
+
+/** 从回复页里取那个一次性 auth。 */
+export function parseReplyAuth(text) {
+  return (String(text).match(/"auth":"([0-9a-fA-F]+)"/) || [])[1] || ''
+}
+
+/** 出错页里那句人话（NGA 的报错都是 <div class='error'>…</div>）。 */
+function replyErrorText(text) {
+  const m = String(text).match(/\(ERROR:\s*\d+\s*\)([^<]{0,200})/)
+  if (m) return m[1].trim()
+  const t = htmlToText(text).replace(/\s+/g, ' ').trim()
+  return t.slice(0, 300)
+}
+
+/**
+ * 回一帖。auth 是 { uid, token }。
+ *   fid  不给就自己从 read.php 里取
+ *   pid  给了就是楼中楼（回复某一层）
+ * 返回 { ok, message, status }。
+ */
+export async function replyTopic({ tid, fid, content, pid, subject }, auth, signal) {
+  if (!tid) throw new Error('要给 tid')
+  if (!auth || !auth.uid || !auth.token) throw new Error('要先登录才能回复')
+  const body = String(content ?? '').trim()
+  const chars = [...body].length
+  const size = Buffer.byteLength(body, 'utf8')
+  // 服务端报的是「6~65530 byte」，但实测「你好」（6 字节 / 2 字）会被拒——
+  // 所以本地按**字符数**卡 6，宁可严一点。
+  if (chars < 6) throw new Error('内容太短：NGA 至少要 6 个字')
+  if (size > 65530) throw new Error('内容太长：NGA 上限 65530 字节')
+
+  let useFid = fid ? String(fid) : ''
+  if (!useFid) {
+    const page = await fetchTopicPage({ tid, page: 1 }, auth, signal)
+    useFid = page.fid || ''
+  }
+  if (!useFid) throw new Error('取不到版面 fid（帖子可能不存在或被锁）')
+
+  const pre = await postReplyPage({ tid, fid: useFid }, auth, '', signal)
+  const authCode = parseReplyAuth(pre.text)
+  if (!authCode) {
+    const why = replyErrorText(pre.text)
+    return { ok: false, status: pre.status, message: why || '没拿到回复口令（可能没登录、或这个版不让回）' }
+  }
+
+  const payload = new URLSearchParams()
+  payload.set('step', '2')
+  payload.set('auth', authCode)
+  payload.set('post_content', body)
+  payload.set('pid', pid ? String(pid) : '')
+  payload.set('post_subject', subject ? String(subject) : '')
+  payload.set('__inchst', 'UTF-8')
+
+  const out = await postReplyPage({ tid, fid: useFid }, auth, payload.toString(), signal)
+  if (/\(ERROR:\s*\d+\s*\)/.test(out.text)) {
+    return { ok: false, status: out.status, message: replyErrorText(out.text) }
+  }
+  if (out.status >= 400) {
+    return { ok: false, status: out.status, message: replyErrorText(out.text) || `HTTP ${out.status}` }
+  }
+  return { ok: true, status: out.status, message: '发出去了', fid: useFid }
 }
