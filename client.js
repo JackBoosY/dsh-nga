@@ -49,8 +49,9 @@ window.__ModuleLoader__.load({
       const [patrol, setPatrol] = React.useState(null)
       const [patrolBusy, setPatrolBusy] = React.useState(false)
       const [patrolError, setPatrolError] = React.useState('')
-      const [realPost, setRealPost] = React.useState(false)
       const [replyText, setReplyText] = React.useState('提示：此账号只发主题、无任何回复记录')
+      const [sending, setSending] = React.useState(false)
+      const [sendResult, setSendResult] = React.useState(null)
       const timer = React.useRef(null)
 
       React.useEffect(() => () => { if (timer.current) clearTimeout(timer.current) }, [])
@@ -103,18 +104,32 @@ window.__ModuleLoader__.load({
       }
 
       const runPatrol = async () => {
-        setPatrolBusy(true); setPatrolError(''); setPatrol(null)
+        setPatrolBusy(true); setPatrolError(''); setPatrol(null); setSendResult(null)
         try {
           const v = await api('patrol', {
             fid: '-7',
             page: 1,
             maxUsers: 12,
-            dryRun: !realPost,
+            dryRun: true, // 巡检永远只报告；真要发走第二步 patrolSend
             text: replyText,
           })
           if (v.ok === false) { setPatrolError(v.error || '跑失败了'); setPatrolBusy(false); return }
           pollPatrol()
         } catch (err) { setPatrolError(String(err.message || err)); setPatrolBusy(false) }
+      }
+
+      const sendCandidates = async () => {
+        const tids = (patrol && patrol.results ? patrol.results : [])
+          .filter(r => (r.verdict || '').startsWith('★'))
+          .map(r => r.tid)
+        if (!tids.length) return
+        setSending(true); setPatrolError(''); setSendResult(null)
+        try {
+          const v = await api('patrolSend', { tids, text: replyText, confirm: true })
+          if (v.ok === false) setPatrolError(v.error || '发失败了')
+          else setSendResult(v)
+        } catch (err) { setPatrolError(String(err.message || err)) }
+        setSending(false)
       }
 
       const pollPatrol = () => {
@@ -213,18 +228,10 @@ window.__ModuleLoader__.load({
                 onChange: ev => setReplyText(ev.target.value),
               }),
             ),
-            h('div', { style: st.row },
-              h('label', { style: { ...st.caption, display: 'flex', alignItems: 'center', gap: '6px' } },
-                h('input', {
-                  type: 'checkbox', checked: realPost,
-                  onChange: ev => setRealPost(ev.target.checked),
-                }),
-                '真的发出去（不勾只报告，不碰账号）',
-              ),
-            ),
+            h('div', { style: st.caption }, '巡检只出报告，不碰账号。看完了要发，再点下面那个「就发这几条」。'),
             h('div', { style: st.row },
               h('button', {
-                style: realPost ? st.btnPrimary : st.btn,
+                style: st.btn,
                 disabled: patrolBusy && !patrol,
                 onClick: runPatrol,
               }, patrolBusy ? '跑着…' : '跑一轮巡检'),
@@ -238,10 +245,21 @@ window.__ModuleLoader__.load({
                   h('div', { style: st.caption },
                     `${patrol.running ? '正在跑' : '跑完了'}：查了 ${patrol.checked ?? 0} / ${patrol.totalOperators ?? '?'} 个楼主，`
                     + `可疑 ${patrol.candidates ?? 0} 个`
-                    + `${patrol.dryRun ? '（只报告，没发）' : `，已发 ${patrol.posted ?? 0} 条`}`
                     + `${patrol.stopped ? '，已取消' : ''}`
                     + `${patrol.error ? `，出错：${patrol.error}` : ''}`,
                   ),
+                  (!patrol.running && (patrol.candidates ?? 0) > 0)
+                    ? h('div', { style: st.row },
+                        h('button', { style: st.btnPrimary, disabled: sending, onClick: sendCandidates },
+                          sending ? '发着…' : `就发这几条（${patrol.candidates} 条）`),
+                      )
+                    : null,
+                  sendResult
+                    ? h('div', { style: sendResult.posted ? st.ok : st.error },
+                        `发出 ${sendResult.posted ?? 0} 条 / 共 ${(sendResult.results || []).length} 条：`
+                        + (sendResult.results || []).map(x => `${x.tid} ${x.ok ? '成' : '失败(' + (x.message || '') + ')'}`).join('；'),
+                      )
+                    : null,
                   ...(patrol.results || []).map((r, i) => h('div', {
                     key: String(r.uid) + i,
                     style: { fontSize: '12px', opacity: r.verdict && r.verdict.startsWith('★') ? 1 : 0.7, lineHeight: 1.7 },

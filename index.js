@@ -170,6 +170,30 @@ export function apply(ctx) {
           return sendJson(res, 200, { ok: true, cancelled: true })
         }
 
+        // 第二步：报告看过了、人来点「就发这几条」，才真发。
+        // 必须显式 confirm，且只接受 tids 列表 —— 不再由巡检自己直接发。
+        if (action === 'patrolSend') {
+          const creds = await readCreds(store)
+          if (!creds) return sendJson(res, 200, { ok: false, error: '还没登录' })
+          if (body.confirm !== true) return sendJson(res, 200, { ok: false, error: '要显式 confirm' })
+          const tids = Array.isArray(body.tids) ? body.tids.map(String).filter((t) => /^\d+$/.test(t)).slice(0, 5) : []
+          if (!tids.length) return sendJson(res, 200, { ok: false, error: '没给 tids' })
+          const content = typeof body.text === 'string' && body.text.trim()
+            ? body.text.trim()
+            : '提示：此账号只发主题、无任何回复记录'
+          const out = []
+          for (const tid of tids) {
+            try {
+              const r = await replyTopic({ tid, fid: body.fid || '-7', content }, creds, AbortSignal.timeout(45000))
+              out.push({ tid, ok: r.ok, message: r.message })
+            } catch (e) {
+              out.push({ tid, ok: false, message: e && e.message ? e.message : String(e) })
+            }
+            await new Promise((r) => setTimeout(r, 1200))
+          }
+          return sendJson(res, 200, { ok: true, results: out, posted: out.filter((x) => x.ok).length })
+        }
+
         return sendJson(res, 404, { error: '不认识的 action: ' + action })
       } catch (error) {
         return sendJson(res, 500, { error: error && error.message ? error.message : String(error) })

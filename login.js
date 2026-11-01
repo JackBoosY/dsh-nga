@@ -684,8 +684,23 @@ export async function patrolOnce({
 
     if (posts > 0) { push({ ...o, topics, posts, verdict: `回过 ${posts} 条` }); continue }
 
-    // 到这里就是「只发主题、从不回帖」
-    const row = { ...o, topics, posts: 0, verdict: '★只发主题、从不回帖' }
+    // 第一次判成「没回复」时不直接下结论 —— 再独立查一次。
+    // 主人定的规矩：两次都一样，才认（2026-11-01 误判过一次，就是因为只信了一次）。
+    await boardGap()
+    let posts2
+    try {
+      const b2 = await listUserActivity({ uid: o.uid, includeReplies: true }, auth, signal)
+      if (!b2.valid) { push({ ...o, topics, posts: 0, verdict: '复查没拿到，判不了' }); continue }
+      posts2 = b2.items.length
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e
+      push({ ...o, topics, verdict: '复查出错: ' + e.message })
+      continue
+    }
+    if (posts2 > 0) { push({ ...o, topics, posts: posts2, verdict: `复查发现有 ${posts2} 条回复（第一次是空壳页）` }); continue }
+
+    // 两次都说「没有回复」→ 认
+    const row = { ...o, topics, posts: 0, confirmedTwice: true, verdict: '★只发主题、从不回帖（查了两次）' }
     if (!dryRun) {
       try {
         const r = await replyTopic({ tid: o.tid, fid, content: text }, auth, signal)
