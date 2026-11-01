@@ -1,0 +1,44 @@
+{
+  "name": "dsh-nga",
+  "version": "0.0.1",
+  "description": "Read NGA (艾泽拉斯国家地理) topics from DeepSeek Harness: sign in with account + captcha, then read threads",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./login": "./login.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "login.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "JackBoosY",
+  "keywords": ["dsh", "dsh-plugin", "nga", "bbs"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JackBoosY/dsh-nga.git"
+  },
+  "homepage": "https://github.com/JackBoosY/dsh-nga#readme",
+  "bugs": {
+    "url": "https://github.com/JackBoosY/dsh-nga/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.3"
+  }
+}

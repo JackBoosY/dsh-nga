@@ -1,0 +1,4 @@
+# dsh-nga 的插件层：把自己插进配置树。
+- insert:
+    - id: dsh-nga
+      name: dsh-nga
