@@ -72,6 +72,19 @@ dsh plugin --profile web add github:JackBoosY/dsh-nga
 > 注意：这条路径只验证到"服务端接受请求形状"（空正文会被拒：`内容过短或过长(ERROR: 2048)`），
 > **尚未做过一次真实发布验证**。第一次真发之前，请先在一条无关紧要的帖子里试。
 
+## 看某个用户发过什么
+
+工具 `nga_user`，只读。
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `uid` | string | 必填，NGA 用户 id；填 `me` 就是当前登录的账号 |
+| `includeReplies` | boolean | `true` 列他发的帖（含回复摘录）；默认只列他开的主题 |
+| `page` | integer | 页码，默认 1 |
+| `maxItems` | integer | 最多显示多少条，默认 30 |
+
+数据来自 `thread.php?authorid=<uid>`（主题）和 `thread.php?authorid=<uid>&searchpost=1`（帖子）。
+
 ## 功能范围
 
 支持：
@@ -80,6 +93,7 @@ dsh plugin --profile web add github:JackBoosY/dsh-nga
 - 分页，以及一次读取多页（最多 5 页）；
 - 只看楼主（`authorOnly`）、只看指定用户（`authorId`）；
 - 解析帖子标题与版面名；
+- 看某个用户发过的主题 / 帖子（`nga_user`）；
 - 回复（`nga_reply`，需显式 `confirm: true`）。
 
 不支持：

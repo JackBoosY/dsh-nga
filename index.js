@@ -13,7 +13,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fetchCaptcha, newRid, passwordLogin, readTopic, replyTopic } from './login.js'
+import { fetchCaptcha, listUserActivity, newRid, passwordLogin, readTopic, replyTopic, userActivityToText } from './login.js'
 
 export const name = 'dsh-nga'
 export const inject = ['tools', 'credentials', 'webServer']
@@ -231,6 +231,48 @@ export function apply(ctx) {
       return out.ok
         ? `发出去了（HTTP ${out.status}${out.fid ? `，fid ${out.fid}` : ''}）。`
         : `没发成：${out.message}`
+    },
+  })
+
+  // ---------- 工具：看某个用户发过什么 ----------
+  ctx.tools.register({
+    name: 'nga_user',
+    description:
+      'List what a user has posted on NGA (bbs.nga.cn): either the topics they started, or every post including '
+      + 'replies (with a snippet of what they wrote). Read-only.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        uid: { type: 'string', description: 'NGA user id (number). Use "me" for the signed-in account.' },
+        includeReplies: { type: 'boolean', description: 'true = every post including replies; false/omitted = topics only' },
+        page: { type: 'integer', description: 'Page number, default 1' },
+        maxItems: { type: 'integer', description: 'Max rows to show, default 30' },
+      },
+      required: ['uid'],
+    },
+    output: {
+      schema: { type: 'string' },
+      render(_args, value) { return [{ type: 'text', text: value }] },
+    },
+    async execute(args) {
+      const creds = await readCreds(store)
+      let uid = String(args.uid || '').trim()
+      if (uid === 'me') {
+        if (!creds) return '还没登录，没法用 "me"。请在「设置 → NGA」里登录，或直接给 uid。'
+        uid = creds.uid
+      }
+      const page = Number(args.page) > 0 ? Number(args.page) : 1
+      const out = await listUserActivity(
+        { uid, page, includeReplies: Boolean(args.includeReplies) },
+        creds,
+        AbortSignal.timeout(45000),
+      )
+      if (out.needsLogin) return '这个要登录才能看。请在「设置 → NGA」里登录一次。'
+      if (!out.items.length) return `uid ${out.uid} 这一页没有内容（可能没有权限看，或者这就是空的）。`
+      const maxItems = Number(args.maxItems) > 0 ? Number(args.maxItems) : 30
+      const body = userActivityToText(out, { page, maxItems })
+      return out.pages > page ? `${body}\n（还有第 ${page + 1} 页）` : body
     },
   })
 }

@@ -372,3 +372,122 @@ export async function replyTopic({ tid, fid, content, pid, subject }, auth, sign
   }
   return { ok: true, status: out.status, message: '发出去了', fid: useFid }
 }
+
+// ---------- 用户的发帖记录 ----------
+// thread.php?authorid=<uid>                → 用户发布的主题
+// thread.php?authorid=<uid>&searchpost=1   → 用户发布的帖子（含他的回复）
+// 两种页面用的是同一套行：<tr class='rowN topicrow'>，里面有 tid / 标题 / 版面 / 回复数 / 作者 / 时间戳
+// 回复列表多一段 .topic_content，里面是那句回复的摘录。
+
+const TZ = 'Asia/Shanghai'
+
+/** unix 秒 → 'YYYY-MM-DD HH:mm'（固定按东八区，跟站上显示一致）。 */
+export function fmtNgaTime(sec) {
+  if (!sec) return ''
+  const d = new Date(Number(sec) * 1000)
+  if (Number.isNaN(d.getTime())) return ''
+  const p = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(d)
+  const get = (t) => (p.find((x) => x.type === t) || {}).value || ''
+  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`
+}
+
+/** 解析「用户发布了什么」那张表。 */
+export function parseUserTopics(html) {
+  const src = String(html)
+  const rows = [...src.matchAll(/<tr[^>]*class=['"][^"']*topicrow[^"']*['"][^>]*>([\s\S]*?)<\/tr>/gi)]
+  return rows.map(([, seg]) => {
+    const tid = (seg.match(/read\.php\?tid=(\d+)/) || [])[1] || ''
+    const title = htmlToText((seg.match(/class=['"]topic['"][^>]*>([\s\S]*?)<\/a>/) || [])[1] || '')
+    const forum = htmlToText((seg.match(/class=['"]silver['"][^>]*>(\[[^\]]*\])<\/a>/) || [])[1] || '')
+    const repliesRaw = (seg.match(/class=['"]replies['"][^>]*>(\d+)</) || [])[1]
+    const uid = (seg.match(/func=ucp&uid=(\d+)/) || [])[1] || ''
+    const author = htmlToText((seg.match(/class=['"]author['"][^>]*>([\s\S]*?)<\/a>/) || [])[1] || '')
+    const tsRaw = (seg.match(/class=['"]silver postdate['"][^>]*>(\d+)</) || [])[1]
+    const snippetRaw = htmlToText((seg.match(/id=['"]postcontent\d+_\d+['"][^>]*>([\s\S]*?)<\/span>/) || [])[1] || '')
+    // 摘录里去掉引用的那一段，只留他自己说的话
+    const snippet = snippetRaw.replace(/\[quote\][\s\S]*?\[\/quote\]/gi, '').replace(/\s+/g, ' ').trim()
+    const ts = Number(tsRaw || 0)
+    return {
+      tid,
+      title,
+      forum,
+      replies: repliesRaw ? Number(repliesRaw) : 0,
+      uid,
+      author,
+      time: ts ? ts * 1000 : 0,
+      date: fmtNgaTime(ts),
+      snippet,
+    }
+  }).filter((it) => it.tid)
+}
+
+/** 列表里的最大页码。 */
+export function parseUserPages(html) {
+  let pages = 1
+  for (const m of String(html).matchAll(/thread\.php\?authorid=\d+[^'"]*?page=(\d+)/g)) pages = Math.max(pages, Number(m[1]))
+  // 「下一页(N)」也能给个下限
+  const nx = String(html).match(/下一页\((\d+)\)/)
+  if (nx) pages = Math.max(pages, Number(nx[1]))
+  return pages
+}
+
+/**
+ * 看某个人发过什么。
+ *   includeReplies = false → 只列他开的主题
+ *   includeReplies = true  → 他发的帖子（含回复摘录）
+ */
+export async function listUserActivity({ uid, page = 1, includeReplies = false }, auth, signal) {
+  const id = String(uid || '').trim()
+  if (!/^\d+$/.test(id)) throw new Error('uid 要填数字')
+  const qs = new URLSearchParams({ authorid: id })
+  if (includeReplies) qs.set('searchpost', '1')
+  if (Number(page) > 1) qs.set('page', String(page))
+  const url = `${BASE}thread.php?${qs.toString()}`
+  const form = new URLSearchParams()
+  if (auth && auth.uid) form.set('access_uid', auth.uid)
+  if (auth && auth.token) form.set('access_token', auth.token)
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'User-Agent': READ_UA, 'X-User-Agent': READ_UA, Referer: `${BASE}/`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+    signal,
+  })
+  const buf = Buffer.from(await res.arrayBuffer())
+  let html = buf.toString('utf8')
+  if (html.includes('\uFFFD')) {
+    try { html = new TextDecoder('gb18030').decode(buf) } catch { /* 保留 utf8 */ }
+  }
+  const items = parseUserTopics(html)
+  const plain = htmlToText(html)
+  return {
+    status: res.status,
+    bytes: buf.length,
+    url,
+    uid: id,
+    includeReplies: Boolean(includeReplies),
+    pages: parseUserPages(html),
+    items,
+    needsLogin: res.status === 403 || /未登录|请先登录/.test(plain),
+  }
+}
+
+/** 把列表拼成可读文本。 */
+export function userActivityToText(res, { page = 1, maxItems = 30 } = {}) {
+  const head = `用户 uid ${res.uid} 的${res.includeReplies ? '帖子（含回复）' : '主题'}：第 ${page} 页`
+    + `，共 ${res.pages} 页，本页 ${res.items.length} 条`
+  const lines = res.items.slice(0, maxItems).map((it, i) => {
+    const forum = (it.forum || '?').replace(/^\[/, '').replace(/\]$/, '')
+    const bits = [
+      `${i + 1}. [${forum}] ${it.title || '(无标题)'}`,
+      `tid=${it.tid}`,
+      it.replies ? `${it.replies} 回复` : '',
+      it.date || '',
+    ].filter(Boolean)
+    const snip = it.snippet ? `\n   ↳ ${it.snippet.slice(0, 160)}` : ''
+    return bits.join('  ') + snip
+  })
+  return [head, ...lines].join('\n')
+}
