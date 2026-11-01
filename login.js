@@ -408,8 +408,12 @@ export function parseUserTopics(html) {
     const author = htmlToText((seg.match(/class=['"]author['"][^>]*>([\s\S]*?)<\/a>/) || [])[1] || '')
     const tsRaw = (seg.match(/class=['"]silver postdate['"][^>]*>(\d+)</) || [])[1]
     const snippetRaw = htmlToText((seg.match(/id=['"]postcontent\d+_\d+['"][^>]*>([\s\S]*?)<\/span>/) || [])[1] || '')
-    // 摘录里去掉引用的那一段，只留他自己说的话
-    const snippet = snippetRaw.replace(/\[quote\][\s\S]*?\[\/quote\]/gi, '').replace(/\s+/g, ' ').trim()
+    // 摘录里去掉引用的那一段，只留他自己说的话；顺便剥掉色字/加粗这些 UBB 标签
+    const snippet = snippetRaw
+      .replace(/\[quote\][\s\S]*?\[\/quote\]/gi, '')
+      .replace(/\[\/?(?:color|b|i|u|size|font|del|s|table|tr|td|list|\*)[^\]]*\]/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim()
     const ts = Number(tsRaw || 0)
     return {
       tid,
@@ -423,6 +427,8 @@ export function parseUserTopics(html) {
       snippet,
     }
   }).filter((it) => it.tid)
+    // NGA 会把「已过期」的位子占成 tid=2/5 这种假行，标题固定是这句，剔掉
+    .filter((it) => !(/帖子发布或回复时间超过限制/.test(it.title) && Number(it.tid) < 100))
 }
 
 /** 列表里的最大页码。 */
