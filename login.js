@@ -118,9 +118,76 @@ export function htmlToText(html) {
     .split('\n').map(l => l.replace(/[ \t\u3000]+/g, ' ').trim()).filter(Boolean).join('\n')
 }
 
-/** 读一个帖子。auth 是 { uid, token }。 */
-export async function readTopic({ tid, page = 1, authorId }, auth, signal) {
-  if (!tid) throw new Error('要给 tid')
+// ---------- 楼层解析 ----------
+// 结构（2026-11-01 用真实 HTML 核过）：
+//   <tr id='post1strow0' class='postrow'>     每层一个
+//     <a href='nuke.php?func=ucp&uid=41048233' id='postauthor0'>   作者 uid（名字不在标签里）
+//     <span id='postdate0' title='reply time'>2019-08-27 06:49</span>
+//     <h3 id='postsubject0'>…</h3>
+//     <p id='postcontent0' class='postcontent ubbcode'>…</p>
+//   用户名在头部 <script> 里：commonui.userInfo.setAll({"41048233":{"uid":…,"username":"…"}})
+
+/** uid → 用户名。取不到的就不放进去（调用方自己兜底）。 */
+export function parseUsers(html) {
+  const out = {}
+  const re = /"uid":(\d+),"username":"((?:[^"\\]|\\.)*)"/g
+  for (const m of String(html).matchAll(re)) {
+    try { out[m[1]] = JSON.parse(`"${m[2]}"`) } catch { out[m[1]] = m[2] }
+  }
+  return out
+}
+
+/** UBB 渲染出来的 HTML → 干净文本。引用块和图片单独标一下，别混进正文。 */
+function ubbToText(html) {
+  return htmlToText(String(html)
+    .replace(/<div class=['"]quote['"][\s\S]*?<\/div>\s*<\/div>/gi, '\n[引用]\n')
+    .replace(/<div class=['"]quote['"][\s\S]*?<\/div>/gi, '\n[引用]\n')
+    .replace(/<img[^>]*>/gi, '[图]'))
+}
+
+/** 拆楼层。返回 [{ lou, index, uid, author, date, subject, content }]。 */
+export function parseFloors(html) {
+  const src = String(html)
+  const users = parseUsers(src)
+  const marks = []
+  for (const m of src.matchAll(/<tr id='post\d+strow(\d+)'/g)) marks.push({ index: Number(m[1]), at: m.index })
+  const floors = []
+  for (let i = 0; i < marks.length; i++) {
+    const seg = src.slice(marks[i].at, i + 1 < marks.length ? marks[i + 1].at : src.length)
+    const idx = marks[i].index
+    const uid = (seg.match(/func=ucp&(?:amp;)?uid=(\d+)/) || [])[1] || ''
+    const date = ((seg.match(/id='postdate\d+'[^>]*>([^<]*)</) || [])[1] || '').trim()
+    const subject = htmlToText((seg.match(/id='postsubject\d+'[^>]*>([\s\S]*?)<\/h3>/) || [])[1] || '')
+    // 正文容器是 p / div / span 都可能（楼主用 <p>，回复常是 <span>），所以按同名标签闭合来截
+    const raw = (seg.match(/<(\w+) id='postcontent\d+'[^>]*>([\s\S]*?)<\/\1>/) || [])[2] ?? ''
+    floors.push({ lou: idx, index: idx, uid, author: users[uid] || '', date, subject, content: ubbToText(raw) })
+  }
+  return floors
+}
+
+/** 帖子标题 / 版面 / 最大页码。 */
+export function parseTopicMeta(html) {
+  const src = String(html)
+  const title = htmlToText((src.match(/id='currentTopicName'[^>]*>([\s\S]*?)<\/h1>/) || [])[1] || '')
+  const forum = htmlToText((src.match(/id='currentForumName'[^>]*>([\s\S]*?)<\/h2>/) || [])[1] || '')
+  let pages = 1
+  for (const m of src.matchAll(/read\.php\?tid=\d+&(?:amp;)?page=(\d+)/g)) pages = Math.max(pages, Number(m[1]))
+  return { title, forum, pages }
+}
+
+/** 把一页楼层拼成给人/模型看的文本。 */
+export function floorsToText(floors, { page = 1, pages = 1, total = 0 } = {}) {
+  const head = [`第 ${page} 页${pages > 1 ? ` / 共 ${pages} 页` : ''}${total ? `，本页 ${total} 层` : ''}`]
+  const body = floors.map((f) => {
+    const who = f.author || (f.uid ? `uid ${f.uid}` : '匿名')
+    const lou = f.lou === 0 ? '楼主' : `${f.lou} 楼`
+    const sub = f.subject && f.subject !== '' ? `\n${f.subject}` : ''
+    return `\n【${lou}】${who}${f.date ? '  ' + f.date : ''}${sub}\n${f.content || '(空)'}`
+  })
+  return head.concat(body).join('\n').trim()
+}
+
+async function fetchTopicPage({ tid, page = 1, authorId }, auth, signal) {
   const qs = new URLSearchParams({ tid: String(tid) })
   if (Number(page) > 1) qs.set('page', String(page))
   if (authorId) qs.set('authorid', String(authorId))
@@ -135,6 +202,74 @@ export async function readTopic({ tid, page = 1, authorId }, auth, signal) {
   if (html.includes('\uFFFD')) {
     try { html = new TextDecoder('gb18030').decode(buf) } catch { /* 保留 utf8 */ }
   }
-  const text = htmlToText(html)
-  return { status: res.status, bytes: buf.length, text, url, needsLogin: res.status === 403 || /未登录/.test(text) }
+  const meta = parseTopicMeta(html)
+  const floors = parseFloors(html)
+  const plain = htmlToText(html)
+  return {
+    status: res.status,
+    bytes: buf.length,
+    url,
+    html,
+    ...meta,
+    floors,
+    text: floors.length ? floorsToText(floors, { page: Number(page), pages: meta.pages, total: floors.length }) : plain,
+    needsLogin: res.status === 403 || /未登录|请先登录/.test(plain),
+  }
+}
+
+/**
+ * 读一个帖子。
+ *   pages: 读多页，'1-3' 或 3（从 1 开始）或 [1,2]
+ *   authorOnly: 只看楼主（自动取楼主 uid，再带 authorid 重读）
+ * auth 是 { uid, token }。
+ */
+export async function readTopic({ tid, page = 1, pages, authorId, authorOnly, maxPages = 5 }, auth, signal) {
+  if (!tid) throw new Error('要给 tid')
+  const list = normalizePages(pages, page, maxPages)
+  let effectiveAuthor = authorId ? String(authorId) : undefined
+  const results = []
+  for (const p of list) {
+    let one = await fetchTopicPage({ tid, page: p, authorId: effectiveAuthor }, auth, signal)
+    if (authorOnly && !effectiveAuthor) {
+      const op = one.floors.find((f) => f.lou === 0 && f.uid) || one.floors.find((f) => f.uid)
+      if (op && op.uid) {
+        effectiveAuthor = op.uid
+        one = await fetchTopicPage({ tid, page: p, authorId: effectiveAuthor }, auth, signal)
+      }
+    }
+    results.push(one)
+    if (one.needsLogin || one.status !== 200) break
+  }
+  const first = results[0] || { status: 0, floors: [], text: '', pages: 1, title: '', forum: '' }
+  const text = results.map((r) => r.text).join('\n\n').trim()
+  return {
+    status: first.status,
+    bytes: results.reduce((n, r) => n + (r.bytes || 0), 0),
+    url: first.url,
+    title: first.title,
+    forum: first.forum,
+    pages: Math.max(first.pages || 1, ...results.map((r) => r.pages || 1)),
+    authorId: effectiveAuthor || '',
+    floors: results.flatMap((r) => r.floors),
+    text,
+    needsLogin: first.needsLogin,
+  }
+}
+
+/** '1-3' / 3 / [1,2] / 不给 → [page]；上限 maxPages 页。 */
+export function normalizePages(pages, page = 1, maxPages = 5) {
+  const cap = Math.max(1, Number(maxPages) || 5)
+  if (pages == null || pages === '') return [Math.max(1, Number(page) || 1)]
+  if (Array.isArray(pages)) return pages.map(Number).filter((n) => n >= 1).slice(0, cap).sort((a, b) => a - b)
+  const s = String(pages).trim()
+  const range = s.match(/^(\d+)\s*[-~]\s*(\d+)$/)
+  if (range) {
+    const from = Math.max(1, Number(range[1]))
+    const to = Math.max(from, Number(range[2]))
+    const out = []
+    for (let n = from; n <= to && out.length < cap; n++) out.push(n)
+    return out
+  }
+  const one = Number(s)
+  return [Number.isFinite(one) && one >= 1 ? one : Math.max(1, Number(page) || 1)]
 }

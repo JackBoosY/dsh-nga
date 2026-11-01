@@ -110,9 +110,9 @@ export function apply(ctx) {
         if (action === 'read') {
           const creds = await readCreds(store)
           const out = await readTopic(
-            { tid: body.tid, page: body.page, authorId: body.authorId },
+            { tid: body.tid, page: body.page, pages: body.pages, authorId: body.authorId, authorOnly: Boolean(body.authorOnly) },
             creds,
-            AbortSignal.timeout(30000),
+            AbortSignal.timeout(45000),
           )
           return sendJson(res, 200, { ok: true, ...out })
         }
@@ -146,15 +146,18 @@ export function apply(ctx) {
   ctx.tools.register({
     name: 'nga_read',
     description:
-      'Read one NGA (bbs.nga.cn) topic as plain text. Needs a stored account; if it answers that login is '
+      'Read one NGA (bbs.nga.cn) topic as plain text, floor by floor (who / when / what). Can read several pages at '
+      + 'once and can read only the topic starter (只看楼主). Needs a stored account; if it answers that login is '
       + 'needed, ask the user to sign in from Settings → NGA.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         tid: { type: 'string', description: 'Topic id (the number in read.php?tid=...)' },
-        page: { type: 'integer', description: 'Page number, default 1' },
-        authorId: { type: 'string', description: 'Only this author (NGA 的“只看TA”)' },
+        page: { type: 'integer', description: 'Single page number, default 1 (ignored when pages is given)' },
+        pages: { type: 'string', description: 'Several pages: "2" or "1-3". At most 5 pages per call.' },
+        authorOnly: { type: 'boolean', description: 'Only the topic starter (NGA 的“只看楼主”)' },
+        authorId: { type: 'string', description: 'Only this author uid (NGA 的“只看TA”)' },
         maxChars: { type: 'integer', description: 'Truncate the returned text to this many characters (default 8000)' },
       },
       required: ['tid'],
@@ -166,13 +169,26 @@ export function apply(ctx) {
     async execute(args) {
       const creds = await readCreds(store)
       const out = await readTopic(
-        { tid: args.tid, page: args.page || 1, authorId: args.authorId },
+        {
+          tid: args.tid,
+          page: args.page || 1,
+          pages: args.pages,
+          authorId: args.authorId,
+          authorOnly: Boolean(args.authorOnly),
+        },
         creds,
-        AbortSignal.timeout(30000),
+        AbortSignal.timeout(45000),
       )
       if (out.needsLogin) return '这条要登录才能读。请在「设置 → NGA」里登录一次。'
+      const head = [
+        out.title ? `标题：${out.title}` : '',
+        out.forum ? `版面：${out.forum}` : '',
+        out.authorId ? `只看：uid ${out.authorId}` : '',
+        out.floors && out.floors.length ? `共 ${out.floors.length} 层` : '',
+      ].filter(Boolean).join('\n')
+      const body = head ? `${head}\n\n${out.text}` : out.text
       const limit = Number(args.maxChars) > 0 ? Number(args.maxChars) : 8000
-      return out.text.length > limit ? out.text.slice(0, limit) + '\n…（后面截掉了）' : out.text
+      return body.length > limit ? body.slice(0, limit) + '\n…（后面截掉了）' : body
     },
   })
 }
