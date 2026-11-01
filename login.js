@@ -214,7 +214,8 @@ async function fetchTopicPage({ tid, page = 1, authorId }, auth, signal) {
     ...meta,
     floors,
     text: floors.length ? floorsToText(floors, { page: Number(page), pages: meta.pages, total: floors.length }) : plain,
-    needsLogin: res.status === 403 || /未登录|请先登录/.test(plain),
+    // 同上：只信状态码。正文里出现「未登录」可能只是别人的帖子内容。
+    needsLogin: res.status === 403,
   }
 }
 
@@ -470,7 +471,9 @@ export async function listUserActivity({ uid, page = 1, includeReplies = false }
     includeReplies: Boolean(includeReplies),
     pages: parseUserPages(html),
     items,
-    needsLogin: res.status === 403 || /未登录|请先登录/.test(plain),
+    // 只看 HTTP 状态。以前还判断正文里有没有「未登录」——结果有人发的帖子内容
+    // 正好是「未登录」两个字，被误判成没登录（2026-11-01 踩到）。
+    needsLogin: res.status === 403,
   }
 }
 
